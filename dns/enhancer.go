@@ -106,7 +106,6 @@ func (h *ResolverEnhancer) FindHostByIP(ip netip.Addr) (string, bool) {
 			return host, true
 		}
 	}
-
 	return "", false
 }
 
@@ -185,7 +184,7 @@ func NewEnhancer(cfg EnhancerConfig) *ResolverEnhancer {
 		if e.fakeIPTTL < 1 {
 			e.fakeIPTTL = 1
 		}
-		e.mapping = lru.New(lru.WithSize[netip.Addr, string](4096))
+		e.mapping = lru.New(lru.WithSize[netip.Addr, string](16384))
 	}
 
 	return e

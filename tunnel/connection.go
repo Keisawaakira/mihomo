@@ -3,14 +3,15 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
 	"time"
 
-	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/sing/common/bufio"
 )
 
 type packetSender struct {
@@ -140,6 +141,8 @@ func (s *packetSender) Send(packet C.PacketAdapter) {
 	case <-s.ctx.Done():
 		packet.Drop() // sender closed when putting data to chan
 	default:
+		metadata := packet.Metadata()
+		log.Warnln("[UDP] sender channel full, drop packet: %s --> %s, process=%s, host=%s", metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host)
 		packet.Drop() // chan is full
 	}
 }
@@ -217,6 +220,139 @@ func closeAllLocalCoon(lAddr string) {
 	})
 }
 
-func handleSocket(inbound, outbound net.Conn) {
-	N.Relay(inbound, outbound)
+
+func handleSocket(metadata *C.Metadata, inbound, outbound net.Conn) {
+	defer func() {
+		_ = inbound.Close()
+		_ = outbound.Close()
+	}()
+
+	ch := make(chan error, 1)
+	go func() {
+		ch <- relay(metadata, "download", inbound, outbound)
+	}()
+
+	_ = relay(metadata, "upload", outbound, inbound)
+	<-ch
+}
+
+func relay(metadata *C.Metadata, direction string, writer net.Conn, reader net.Conn) error {
+	startedAt := time.Now()
+	written, err := bufio.Copy(writer, reader)
+	if err == nil {
+		_, closeErr := closeWrite(writer)
+		_ = closeErr
+		return nil
+	}
+
+	closeResult := softCloseRelaySide(writer)
+	if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		duration := time.Since(startedAt).Round(time.Millisecond)
+		log.Warnln(
+			"[TCP] relay %s error after %d bytes in %s: %s (%s --> %s, process=%s, host=%s, close_write=%t, close_write_target=%T, close_write_err=%v, close_read=%t, close_read_target=%T, close_read_err=%v, hard_close=%t, hard_close_err=%v, writer_type=%T, reader_type=%T)",
+			direction,
+			written,
+			duration,
+			err.Error(),
+			metadata.SourceDetail(),
+			metadata.RemoteAddress(),
+			metadata.Process,
+			metadata.Host,
+			closeResult.closeWrite,
+			closeResult.closeWriteTarget,
+			closeResult.closeWriteErr,
+			closeResult.closeRead,
+			closeResult.closeReadTarget,
+			closeResult.closeReadErr,
+			closeResult.hardClose,
+			closeResult.hardCloseErr,
+			writer,
+			reader,
+		)
+	}
+	return err
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+type closeReader interface {
+	CloseRead() error
+}
+
+type upstreamer interface {
+	Upstream() any
+}
+
+type relayCloseResult struct {
+	closeWrite       bool
+	closeWriteTarget any
+	closeWriteErr    error
+	closeRead        bool
+	closeReadTarget  any
+	closeReadErr     error
+	hardClose        bool
+	hardCloseErr     error
+}
+
+func softCloseRelaySide(conn net.Conn) relayCloseResult {
+	var result relayCloseResult
+	if writeCloser, ok := unwrapCloseWriter(conn); ok {
+		result.closeWrite = true
+		result.closeWriteTarget = writeCloser
+		result.closeWriteErr = writeCloser.CloseWrite()
+	}
+	if readCloser, ok := unwrapCloseReader(conn); ok {
+		result.closeRead = true
+		result.closeReadTarget = readCloser
+		result.closeReadErr = readCloser.CloseRead()
+		return result
+	}
+	if !result.closeWrite {
+		result.hardClose = true
+		result.hardCloseErr = conn.Close()
+	}
+	return result
+}
+
+func closeWrite(conn net.Conn) (bool, error) {
+	if writeCloser, ok := unwrapCloseWriter(conn); ok {
+		return false, writeCloser.CloseWrite()
+	}
+	return true, conn.Close()
+}
+
+func unwrapCloseWriter(conn any) (closeWriter, bool) {
+	for i := 0; i < 16 && conn != nil; i++ {
+		if writeCloser, ok := conn.(closeWriter); ok {
+			return writeCloser, true
+		}
+		if upstream, ok := conn.(upstreamer); ok {
+			next := upstream.Upstream()
+			if next != nil && next != conn {
+				conn = next
+				continue
+			}
+		}
+		return nil, false
+	}
+	return nil, false
+}
+
+func unwrapCloseReader(conn any) (closeReader, bool) {
+	for i := 0; i < 16 && conn != nil; i++ {
+		if readCloser, ok := conn.(closeReader); ok {
+			return readCloser, true
+		}
+		if upstream, ok := conn.(upstreamer); ok {
+			next := upstream.Upstream()
+			if next != nil && next != conn {
+				conn = next
+				continue
+			}
+		}
+		return nil, false
+	}
+	return nil, false
 }

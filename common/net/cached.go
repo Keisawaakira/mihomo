@@ -39,6 +39,20 @@ func (c *CachedConn) Upstream() any {
 	return c.ExtendedConn
 }
 
+func (c *CachedConn) CloseWrite() error {
+	if cw, ok := c.ExtendedConn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.ExtendedConn.Close()
+}
+
+func (c *CachedConn) CloseRead() error {
+	if cr, ok := c.ExtendedConn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return c.ExtendedConn.Close()
+}
+
 func (c *CachedConn) ReaderReplaceable() bool {
 	if len(c.data) > 0 {
 		return false
