@@ -217,6 +217,10 @@ jobs:
         echo "CGO_ENABLED=1" >> $GITHUB_ENV
         echo "BUILDTAG=" >> $GITHUB_ENV
 
+    - name: Sync Go modules
+      run: |
+        go mod tidy
+
     - name: Test
       if: ${{ matrix.jobs.test == 'test' }}
       run: |

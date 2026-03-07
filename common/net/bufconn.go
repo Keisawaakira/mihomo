@@ -94,6 +94,20 @@ func (c *BufferedConn) Upstream() any {
 	return c.ExtendedConn
 }
 
+func (c *BufferedConn) CloseWrite() error {
+	if cw, ok := c.ExtendedConn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.ExtendedConn.Close()
+}
+
+func (c *BufferedConn) CloseRead() error {
+	if cr, ok := c.ExtendedConn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return c.ExtendedConn.Close()
+}
+
 func (c *BufferedConn) ReaderReplaceable() bool {
 	if c.r != nil && c.r.Buffered() > 0 {
 		return false
