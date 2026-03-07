@@ -166,6 +166,11 @@ tun:
   #   - "lan0"
   # exclude-interface: # 排除路由的接口，与 `include-interface` 冲突
   #   - "lan1"
+  # exclude-process: # Bypass these executable names from tun on Windows (best effort, resolved to current exe paths)
+  #   - "BitComet_x64.exe"
+  # exclude-process-path: # Bypass these executable paths from tun on Windows
+  #   - "C:\Software\BitComet\BitComet_x64.exe"
+
   # include-uid: # UID 规则仅在 Linux 下被支持，并且需要 auto-route
   # - 0
   # include-uid-range: # 限制被路由的的用户范围

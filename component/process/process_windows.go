@@ -115,6 +115,7 @@ type searcher struct {
 func (s *searcher) Search(b []byte, ip netip.Addr, port uint16) (uint32, error) {
 	n := int(readNativeUint32(b[:4]))
 	itemSize := s.itemSize
+	var fallbackPID uint32
 	for i := 0; i < n; i++ {
 		row := b[4+itemSize*i : 4+itemSize*(i+1)]
 
@@ -138,13 +139,25 @@ func (s *searcher) Search(b []byte, ip netip.Addr, port uint16) (uint32, error) 
 
 		srcIP, _ := netip.AddrFromSlice(row[s.ip : s.ip+s.ipSize])
 		srcIP = srcIP.Unmap()
+		pid := readNativeUint32(row[s.pid : s.pid+4])
+		// TUN metadata may carry the TUN-side source IP instead of the process socket's
+		// bound local address. For UDP, keep a port-only fallback after preferring exact
+		// and unspecified-address matches.
+		if s.tcpState == -1 && srcIP.IsValid() && !srcIP.IsUnspecified() && ip != srcIP {
+			if fallbackPID == 0 {
+				fallbackPID = pid
+			}
+			continue
+		}
 		// windows binds an unbound udp socket to 0.0.0.0/[::] while first sendto
 		if ip != srcIP && (!srcIP.IsUnspecified() || s.tcpState != -1) {
 			continue
 		}
 
-		pid := readNativeUint32(row[s.pid : s.pid+4])
 		return pid, nil
+	}
+	if fallbackPID != 0 {
+		return fallbackPID, nil
 	}
 	return 0, ErrNotFound
 }

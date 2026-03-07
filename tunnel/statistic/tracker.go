@@ -88,6 +88,20 @@ func (tt *tcpTracker) Write(b []byte) (int, error) {
 	return n, err
 }
 
+func (tt *tcpTracker) CloseWrite() error {
+	if cw, ok := tt.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return tt.Conn.Close()
+}
+
+func (tt *tcpTracker) CloseRead() error {
+	if cr, ok := tt.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return tt.Conn.Close()
+}
+
 func (tt *tcpTracker) WriteBuffer(buffer *buf.Buffer) (err error) {
 	upload := int64(buffer.Len())
 	err = tt.Conn.WriteBuffer(buffer)

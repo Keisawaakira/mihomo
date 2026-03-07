@@ -37,6 +37,8 @@ type TunOption struct {
 	RouteExcludeAddressSet                []string       `inbound:"route-exclude-address-set,omitempty"`
 	IncludeInterface                      []string       `inbound:"include-interface,omitempty"`
 	ExcludeInterface                      []string       `inbound:"exclude-interface,omitempty"`
+	ExcludeProcess                        []string       `inbound:"exclude-process,omitempty"`
+	ExcludeProcessPath                    []string       `inbound:"exclude-process-path,omitempty"`
 	IncludeUID                            []uint32       `inbound:"include-uid,omitempty"`
 	IncludeUIDRange                       []string       `inbound:"include-uid-range,omitempty"`
 	ExcludeUID                            []uint32       `inbound:"exclude-uid,omitempty"`
@@ -118,6 +120,8 @@ func NewTun(options *TunOption) (*Tun, error) {
 			RouteExcludeAddressSet:                options.RouteExcludeAddressSet,
 			IncludeInterface:                      options.IncludeInterface,
 			ExcludeInterface:                      options.ExcludeInterface,
+			ExcludeProcess:                        options.ExcludeProcess,
+			ExcludeProcessPath:                    options.ExcludeProcessPath,
 			IncludeUID:                            options.IncludeUID,
 			IncludeUIDRange:                       options.IncludeUIDRange,
 			ExcludeUID:                            options.ExcludeUID,

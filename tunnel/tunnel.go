@@ -16,6 +16,7 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/loopback"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/proxydialer"
@@ -68,7 +69,21 @@ var (
 	sniffingEnable    = false
 
 	ruleUpdateCallback = utils.NewCallback[P.RuleProvider]()
+
+	excludedProcessNames []string
+	excludedProcessPaths []string
+	excludedLoopBack      = loopback.NewDetector()
+	excludedProcessCache  = make(map[string]excludedProcessEntry)
+	excludedProcessMu     sync.RWMutex
 )
+const excludedProcessCacheTTL = 2 * time.Minute
+
+type excludedProcessEntry struct {
+	process string
+	path    string
+	expire  time.Time
+}
+
 
 type tunnel struct{}
 
@@ -100,7 +115,13 @@ func (t tunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
 	udpInit.Do(initUDP)
 
 	packetAdapter := C.NewPacketAdapter(packet, metadata)
+	packetMetadata := packetAdapter.Metadata()
 	key := packetAdapter.Key()
+
+	excludedNames, excludedPaths, hasExcluded := snapshotExcludedProcesses()
+	if hasExcluded && shouldShardExcludedUDPPacket(packetMetadata, excludedNames, excludedPaths) {
+		key = excludedUDPKey(packetAdapter, packetMetadata)
+	}
 
 	hash := utils.MapHash(key)
 	queueNo := uint(hash) % uint(len(udpQueues))
@@ -108,6 +129,7 @@ func (t tunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
 	select {
 	case udpQueues[queueNo] <- packetAdapter:
 	default:
+		log.Warnln("[UDP] ingress queue full, drop packet: queue=%d, key=%s, %s --> %s, process=%s, host=%s", queueNo, key, packetMetadata.SourceDetail(), packetMetadata.RemoteAddress(), packetMetadata.Process, packetMetadata.Host)
 		packet.Drop()
 	}
 }
@@ -267,6 +289,177 @@ func SetFindProcessMode(mode process.FindProcessMode) {
 	findProcessMode.Store(mode)
 }
 
+func normalizeExcludedProcessPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	return strings.ToLower(filepath.Clean(path))
+}
+
+func excludedProcessCacheKey(metadata *C.Metadata) string {
+	if metadata == nil || metadata.SrcPort == 0 {
+		return ""
+	}
+	return metadata.NetWork.String() + "|" + metadata.SourceAddress()
+}
+
+func loadExcludedProcessCache(metadata *C.Metadata) bool {
+	key := excludedProcessCacheKey(metadata)
+	if key == "" {
+		return false
+	}
+
+	now := time.Now()
+	excludedProcessMu.RLock()
+	entry, ok := excludedProcessCache[key]
+	excludedProcessMu.RUnlock()
+	if !ok {
+		return false
+	}
+	if now.After(entry.expire) {
+		excludedProcessMu.Lock()
+		delete(excludedProcessCache, key)
+		excludedProcessMu.Unlock()
+		return false
+	}
+	if metadata.Process == "" {
+		metadata.Process = entry.process
+	}
+	if metadata.ProcessPath == "" {
+		metadata.ProcessPath = entry.path
+	}
+	return metadata.Process != "" || metadata.ProcessPath != ""
+}
+
+func storeExcludedProcessCache(metadata *C.Metadata) {
+	key := excludedProcessCacheKey(metadata)
+	if key == "" {
+		return
+	}
+	processName := strings.TrimSpace(metadata.Process)
+	processPath := normalizeExcludedProcessPath(strings.TrimSpace(metadata.ProcessPath))
+	if processName == "" && processPath == "" {
+		return
+	}
+	excludedProcessMu.Lock()
+	excludedProcessCache[key] = excludedProcessEntry{
+		process: processName,
+		path:    processPath,
+		expire:  time.Now().Add(excludedProcessCacheTTL),
+	}
+	excludedProcessMu.Unlock()
+}
+
+func SetExcludedProcesses(names, paths []string) {
+	configMux.Lock()
+	defer configMux.Unlock()
+
+	excludedProcessNames = nil
+	for _, name := range names {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name != "" {
+			excludedProcessNames = append(excludedProcessNames, name)
+		}
+	}
+
+	excludedProcessPaths = nil
+	for _, path := range paths {
+		path = normalizeExcludedProcessPath(strings.TrimSpace(path))
+		if path != "" {
+			excludedProcessPaths = append(excludedProcessPaths, path)
+		}
+	}
+
+	excludedProcessMu.Lock()
+	excludedProcessCache = make(map[string]excludedProcessEntry)
+	excludedProcessMu.Unlock()
+}
+
+func snapshotExcludedProcesses() ([]string, []string, bool) {
+	configMux.RLock()
+	defer configMux.RUnlock()
+	if len(excludedProcessNames) == 0 && len(excludedProcessPaths) == 0 {
+		return nil, nil, false
+	}
+	return append([]string(nil), excludedProcessNames...), append([]string(nil), excludedProcessPaths...), true
+}
+
+func matchesExcludedProcess(metadata *C.Metadata, excludedNames, excludedPaths []string) bool {
+	if metadata.Process != "" {
+		processName := strings.ToLower(strings.TrimSpace(metadata.Process))
+		for _, excludedName := range excludedNames {
+			if processName == excludedName {
+				return true
+			}
+		}
+	}
+
+	if metadata.ProcessPath != "" {
+		processPath := normalizeExcludedProcessPath(strings.TrimSpace(metadata.ProcessPath))
+		for _, excludedPath := range excludedPaths {
+			if processPath == excludedPath {
+				metadata.ProcessPath = processPath
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func shouldShardExcludedUDPPacket(metadata *C.Metadata, excludedNames, excludedPaths []string) bool {
+	if metadata == nil {
+		return false
+	}
+	if metadata.Process == "" && metadata.ProcessPath == "" {
+		loadExcludedProcessCache(metadata)
+	}
+	if matchesExcludedProcess(metadata, excludedNames, excludedPaths) {
+		storeExcludedProcessCache(metadata)
+		return true
+	}
+	if metadata.SrcPort == 0 || !metadata.SrcIP.IsValid() {
+		return false
+	}
+	_, processPath, err := process.FindProcessName(process.UDP, metadata.SrcIP, int(metadata.SrcPort))
+	if err != nil || processPath == "" {
+		return false
+	}
+	metadata.ProcessPath = processPath
+	metadata.Process = filepath.Base(processPath)
+	if matchesExcludedProcess(metadata, excludedNames, excludedPaths) {
+		storeExcludedProcessCache(metadata)
+		return true
+	}
+	return false
+}
+
+func isExcludedProcess(metadata *C.Metadata, helper *C.RuleMatchHelper) bool {
+	excludedNames, excludedPaths, ok := snapshotExcludedProcesses()
+	if !ok {
+		return false
+	}
+
+	if metadata.Process == "" && metadata.ProcessPath == "" {
+		loadExcludedProcessCache(metadata)
+	}
+	if matchesExcludedProcess(metadata, excludedNames, excludedPaths) {
+		storeExcludedProcessCache(metadata)
+		return true
+	}
+
+	if metadata.Process == "" && metadata.ProcessPath == "" && helper != nil && helper.FindProcess != nil {
+		helper.FindProcess()
+		helper.FindProcess = nil
+	}
+
+	if matchesExcludedProcess(metadata, excludedNames, excludedPaths) {
+		storeExcludedProcessCache(metadata)
+		return true
+	}
+
+	return false
+}
 func isHandle(t C.Type) bool {
 	status := status.Load()
 	return status == Running || (status == Inner && t == C.INNER)
@@ -286,25 +479,59 @@ func needLookupIP(metadata *C.Metadata) bool {
 	return resolver.MappingEnabled() && metadata.Host == "" && metadata.DstIP.IsValid()
 }
 
+func applyMappedHost(metadata *C.Metadata, host string, originalDstIP netip.Addr) {
+	metadata.Host = host
+	metadata.DNSMode = C.DNSMapping
+	if resolver.IsFakeIP(originalDstIP) {
+		// only clear dstIP if it is confirmed to be a fake IP
+		metadata.DstIP = netip.Addr{}
+		metadata.DNSMode = C.DNSFakeIP
+	} else if node, ok := resolver.DefaultHosts.Search(host, false); ok {
+		// redir-host should lookup the hosts
+		metadata.DstIP, _ = node.RandIP()
+	} else if node != nil && node.IsDomain {
+		metadata.Host = node.Domain
+	}
+}
+
+func tryRecoverFakeIPMapping(metadata *C.Metadata) bool {
+	if metadata == nil || !metadata.DstIP.IsValid() || !resolver.IsFakeIP(metadata.DstIP) {
+		return false
+	}
+
+	originalDstIP := metadata.DstIP
+	existsInPool := resolver.IsExistFakeIP(originalDstIP)
+	log.Warnln("[FakeIP] record missing, start soft recovery: ip=%s, exists_in_pool=%t, %s --> %s, process=%s, host=%s", originalDstIP, existsInPool, metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host)
+
+	retryDelays := []time.Duration{80 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
+	for attempt, delay := range retryDelays {
+		time.Sleep(delay)
+		host, exist := resolver.FindHostByIP(originalDstIP)
+		if !exist {
+			continue
+		}
+		resolver.InsertHostByIP(originalDstIP, host)
+		applyMappedHost(metadata, host, originalDstIP)
+		log.Warnln("[FakeIP] soft recovery hit: ip=%s, host=%s, attempt=%d, exists_in_pool=%t, %s --> %s, process=%s", originalDstIP, host, attempt+1, existsInPool, metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process)
+		return true
+	}
+
+	log.Warnln("[FakeIP] soft recovery missed: ip=%s, exists_in_pool=%t, %s --> %s, process=%s, host=%s", originalDstIP, existsInPool, metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host)
+	return false
+}
+
 func preHandleMetadata(metadata *C.Metadata) error {
 	// preprocess enhanced-mode metadata
 	if needLookupIP(metadata) {
-		host, exist := resolver.FindHostByIP(metadata.DstIP)
+		originalDstIP := metadata.DstIP
+		host, exist := resolver.FindHostByIP(originalDstIP)
 		if exist {
-			metadata.Host = host
-			metadata.DNSMode = C.DNSMapping
-			if resolver.IsFakeIP(metadata.DstIP) {
-				// only clear dstIP if it is confirmed to be a fake IP
-				metadata.DstIP = netip.Addr{}
-				metadata.DNSMode = C.DNSFakeIP
-			} else if node, ok := resolver.DefaultHosts.Search(host, false); ok {
-				// redir-host should lookup the hosts
-				metadata.DstIP, _ = node.RandIP()
-			} else if node != nil && node.IsDomain {
-				metadata.Host = node.Domain
+			applyMappedHost(metadata, host, originalDstIP)
+		} else if resolver.IsFakeIP(originalDstIP) {
+			if tryRecoverFakeIPMapping(metadata) {
+				return nil
 			}
-		} else if resolver.IsFakeIP(metadata.DstIP) {
-			return fmt.Errorf("fake DNS record %s missing", metadata.DstIP)
+			return fmt.Errorf("fake DNS record %s missing", originalDstIP)
 		}
 	} else if node, ok := resolver.DefaultHosts.Search(metadata.Host, true); ok {
 		// try use domain mapping
@@ -314,15 +541,7 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	return nil
 }
 
-func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
-	if metadata.SpecialProxy != "" {
-		var exist bool
-		proxy, exist = proxies[metadata.SpecialProxy]
-		if !exist {
-			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
-		}
-		return
-	}
+func newRuleMatchHelper(metadata *C.Metadata) C.RuleMatchHelper {
 	var (
 		resolved             bool
 		attemptProcessLookup = metadata.Type != C.INNER
@@ -398,6 +617,140 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		helper.FindProcess = nil
 	}
 
+	return helper
+}
+
+func excludedUDPKey(packet C.PacketAdapter, metadata *C.Metadata) string {
+	return packet.Key() + "|" + metadata.RemoteAddress()
+}
+
+func isConfiguredExcludedFlow(metadata *C.Metadata) bool {
+	if metadata == nil {
+		return false
+	}
+	excludedNames, excludedPaths, ok := snapshotExcludedProcesses()
+	if !ok {
+		return false
+	}
+	return matchesExcludedProcess(metadata, excludedNames, excludedPaths)
+}
+
+func traceRuleLabel(rule C.Rule) string {
+	if rule == nil {
+		return "none"
+	}
+	if payload := rule.Payload(); payload != "" {
+		return fmt.Sprintf("%s(%s)", rule.RuleType().String(), payload)
+	}
+	return rule.RuleType().String()
+}
+
+type excludedDirectConn struct {
+	N.ExtendedConn
+	chain C.Chain
+	addr  string
+}
+
+func (c *excludedDirectConn) Chains() C.Chain { return c.chain }
+func (c *excludedDirectConn) ProviderChains() C.Chain { return nil }
+func (c *excludedDirectConn) AppendToChains(adapter C.ProxyAdapter) {}
+func (c *excludedDirectConn) RemoteDestination() string { return c.addr }
+func (c *excludedDirectConn) CloseWrite() error {
+	if cw, ok := c.ExtendedConn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.ExtendedConn.Close()
+}
+func (c *excludedDirectConn) CloseRead() error {
+	if cr, ok := c.ExtendedConn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return c.ExtendedConn.Close()
+}
+
+type excludedDirectPacketConn struct {
+	N.EnhancePacketConn
+	chain C.Chain
+	addr  string
+}
+
+func (c *excludedDirectPacketConn) Chains() C.Chain { return c.chain }
+func (c *excludedDirectPacketConn) ProviderChains() C.Chain { return nil }
+func (c *excludedDirectPacketConn) AppendToChains(adapter C.ProxyAdapter) {}
+func (c *excludedDirectPacketConn) RemoteDestination() string { return c.addr }
+func (c *excludedDirectPacketConn) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+	return resolveExcludedUDPMetadata(ctx, metadata)
+}
+
+func resolveExcludedUDPMetadata(ctx context.Context, metadata *C.Metadata) error {
+	if metadata.Host != "" {
+		ip, err := resolver.ResolveIPWithResolver(ctx, metadata.Host, resolver.DirectHostResolver)
+		if err != nil {
+			return fmt.Errorf("can't resolve ip: %w", err)
+		}
+		metadata.DstIP = ip
+	}
+	if !metadata.DstIP.IsValid() {
+		return resolver.ErrIPNotFound
+	}
+	return nil
+}
+
+func wrapExcludedTCPConn(conn net.Conn, metadata *C.Metadata) C.Conn {
+	econn := N.NewExtendedConn(conn)
+	wrapped := &excludedDirectConn{ExtendedConn: econn, chain: C.Chain{"DIRECT"}, addr: metadata.RemoteAddress()}
+	return excludedLoopBack.NewConn(wrapped)
+}
+
+func wrapExcludedPacketConn(pc net.PacketConn, metadata *C.Metadata) C.PacketConn {
+	epc := N.NewEnhancePacketConn(pc)
+	wrapped := &excludedDirectPacketConn{EnhancePacketConn: epc, chain: C.Chain{"DIRECT"}, addr: metadata.RemoteAddress()}
+	return excludedLoopBack.NewPacketConn(wrapped)
+}
+
+func dialExcludedTCP(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	dialMetadata := metadata.Clone()
+	if err := excludedLoopBack.CheckConn(dialMetadata); err != nil {
+		return nil, err
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", dialMetadata.RemoteAddress(), dialer.WithResolver(resolver.DirectHostResolver))
+	if err != nil {
+		return nil, err
+	}
+	return wrapExcludedTCPConn(conn, dialMetadata), nil
+}
+
+func listenExcludedUDP(ctx context.Context, metadata *C.Metadata) (C.PacketConn, *C.Metadata, error) {
+	dialMetadata := metadata.Clone()
+	if err := excludedLoopBack.CheckPacketConn(dialMetadata); err != nil {
+		return nil, nil, err
+	}
+	if err := resolveExcludedUDPMetadata(ctx, dialMetadata); err != nil {
+		return nil, nil, err
+	}
+	pc, err := dialer.ListenPacket(ctx, "udp", "", dialMetadata.AddrPort(), dialer.WithResolver(resolver.DirectHostResolver))
+	if err != nil {
+		return nil, nil, err
+	}
+	return wrapExcludedPacketConn(pc, dialMetadata), dialMetadata, nil
+}
+
+func logExcludedDirectErr(metadata *C.Metadata, err error) {
+	log.Debugln("[ExcludeProcess] direct %s error: %s --> %s, process=%s, path=%s, host=%s, dst_ip=%s, err=%s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.ProcessPath, metadata.Host, metadata.DstIP, err.Error())
+}
+
+func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+	if metadata.SpecialProxy != "" {
+		var exist bool
+		proxy, exist = proxies[metadata.SpecialProxy]
+		if !exist {
+			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
+		}
+		return
+	}
+
+	helper := newRuleMatchHelper(metadata)
+
 	switch mode {
 	case Direct:
 		proxy = proxies["DIRECT"]
@@ -431,16 +784,22 @@ func handleUDPConn(packet C.PacketAdapter) {
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
+
 	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
 		packet.Drop()
-		log.Debugln("[Metadata PreHandle] error: %s", err)
+		log.Warnln("[UDP] metadata pre-handle failed: %s (%s --> %s, process=%s, host=%s, dst_ip=%s)", err, metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host, metadata.DstIP)
 		return
 	}
 
+	helper := newRuleMatchHelper(metadata)
+	excluded := isExcludedProcess(metadata, &helper)
 	key := packet.Key()
+	if excluded {
+		key = excludedUDPKey(packet, metadata)
+	}
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
 		sender := newPacketSender()
-		if sniffingEnable && snifferDispatcher.Enable() {
+		if !excluded && sniffingEnable && snifferDispatcher.Enable() {
 			return snifferDispatcher.UDPSniff(packet, sender)
 		}
 		return sender
@@ -450,12 +809,30 @@ func handleUDPConn(packet C.PacketAdapter) {
 			originMetadata := metadata  // save origin metadata
 			metadata = metadata.Clone() // don't modify PacketAdapter's metadata
 
-			if err := sender.DoSniff(metadata); err != nil {
-				log.Warnln("[UDP] DoSniff error: %s", err.Error())
-				return nil, nil, err
+			if !excluded {
+				if err := sender.DoSniff(metadata); err != nil {
+					log.Warnln("[UDP] DoSniff error: %s", err.Error())
+					return nil, nil, err
+				}
 			}
 
 			_ = preHandleMetadata(metadata) // error was pre-checked
+			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
+			defer cancel()
+
+			if excluded {
+				pc, dialMetadata, err := listenExcludedUDP(ctx, metadata)
+				if err != nil {
+					logExcludedDirectErr(metadata, err)
+					return nil, nil, err
+				}
+				sender.AddMapping(originMetadata, dialMetadata)
+				oAddrPort := dialMetadata.AddrPort()
+				writeBackProxy := nat.NewWriteBackProxy(packet)
+
+				go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
+				return pc, writeBackProxy, nil
+			}
 
 			proxy, rule, err := resolveMetadata(metadata)
 			if err != nil {
@@ -464,8 +841,6 @@ func handleUDPConn(packet C.PacketAdapter) {
 			}
 
 			dialMetadata := metadata.Pure()
-			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
-			defer cancel()
 			rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
 				return proxy.ListenPacketContext(ctx, dialMetadata)
 			}, func(err error) {
@@ -535,8 +910,23 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	// If both trials have failed, we can do nothing but give up
 	if preHandleFailed {
-		log.Debugln("[Metadata PreHandle] failed to sniff a domain for connection %s --> %s, give up",
-			metadata.SourceDetail(), metadata.RemoteAddress())
+		log.Warnln("[TCP] metadata pre-handle failed and sniff fallback missed: %s --> %s, process=%s, host=%s, dst_ip=%s", metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host, metadata.DstIP)
+		return
+	}
+
+	helper := newRuleMatchHelper(metadata)
+	if isExcludedProcess(metadata, &helper) {
+		ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+		defer cancel()
+		remoteConn, err := dialExcludedTCP(ctx, metadata)
+		if err != nil {
+			logExcludedDirectErr(metadata, err)
+			return
+		}
+		defer func(remoteConn C.Conn) {
+			_ = remoteConn.Close()
+		}(remoteConn)
+		handleSocket(metadata, conn, remoteConn)
 		return
 	}
 
@@ -556,7 +946,6 @@ func handleTCPConn(connCtx C.ConnContext) {
 		log.Warnln("[Metadata] parse failed: %s", err.Error())
 		return
 	}
-
 	dialMetadata := metadata
 	if len(metadata.Host) > 0 {
 		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
@@ -621,7 +1010,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	peekMutex.Lock()
 	defer peekMutex.Unlock()
 	_ = conn.SetReadDeadline(time.Time{}) // reset
-	handleSocket(conn, remoteConn)
+	handleSocket(metadata, conn, remoteConn)
 }
 
 func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err error) {

@@ -1,4 +1,4 @@
-package sing_tun
+﻿package sing_tun
 
 import (
 	"context"
@@ -22,6 +22,7 @@ import (
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/sing"
 	"github.com/metacubex/mihomo/log"
+    mihomoTunnel "github.com/metacubex/mihomo/tunnel"
 	"golang.org/x/exp/constraints"
 
 	tun "github.com/metacubex/sing-tun"
@@ -317,6 +318,8 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		Inet6Address:          options.Inet6Address,
 		DisableICMPForwarding: options.DisableICMPForwarding,
 	}
+    mihomoTunnel.SetExcludedProcesses(options.ExcludeProcess, options.ExcludeProcessPath)
+
 	l = &Listener{
 		closed:  false,
 		options: options,
@@ -405,6 +408,8 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		Inet6RouteExcludeAddress:              inet6RouteExcludeAddress,
 		IncludeInterface:                      options.IncludeInterface,
 		ExcludeInterface:                      options.ExcludeInterface,
+		ExcludeProcess:                        options.ExcludeProcess,
+		ExcludeProcessPath:                    options.ExcludeProcessPath,
 		IncludeUID:                            includeUID,
 		ExcludeUID:                            excludeUID,
 		ExcludeSrcPort:                        excludeSrcPort,
@@ -419,6 +424,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		EXP_RecvMsgX:                          options.RecvMsgX,
 		EXP_SendMsgX:                          options.SendMsgX,
 		EXP_ProcessorsPerChannel:              options.ProcessorsPerChannel,
+		Logger:                                log.SingLogger,
 	}
 
 	if options.AutoRedirect {
@@ -544,6 +550,22 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	}
 	l.addrStr = fmt.Sprintf("%s(%s,%s), mtu: %d, auto route: %v, auto redir: %v, ip stack: %s",
 		tunName, tunOptions.Inet4Address, tunOptions.Inet6Address, tunMTU, options.AutoRoute, options.AutoRedirect, options.Stack)
+	log.Warnln(
+		"[TUN] diag start: stack=%s mtu=%d gso=%v gso_max_size=%d udp_timeout=%s auto_route=%v auto_redirect=%v strict_route=%v endpoint_independent_nat=%v dns_hijack=%d auto_detect_interface=%v exclude_process=%d exclude_process_path=%d",
+		options.Stack,
+		tunMTU,
+		options.GSO,
+		options.GSOMaxSize,
+		udpTimeout,
+		options.AutoRoute,
+		options.AutoRedirect,
+		options.StrictRoute,
+		options.EndpointIndependentNat,
+		len(options.DNSHijack),
+		options.AutoDetectInterface,
+		len(options.ExcludeProcess),
+		len(options.ExcludeProcessPath),
+	)
 	return
 }
 
@@ -675,6 +697,8 @@ func (l *Listener) Close() error {
 	if l.cDialerInterfaceFinder != nil {
 		dialer.DefaultInterfaceFinder.CompareAndSwap(l.cDialerInterfaceFinder, nil)
 	}
+    mihomoTunnel.SetExcludedProcesses(nil, nil)
+
 	return common.Close(
 		l.ruleUpdateCallbackCloser,
 		l.tunStack,

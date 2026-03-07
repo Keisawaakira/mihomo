@@ -1,4 +1,4 @@
-package dns
+﻿package dns
 
 import (
 	"net/netip"
@@ -146,7 +146,7 @@ func withMapping(mapping *lru.LruCache[netip.Addr, string]) middleware {
 	}
 }
 
-func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int) middleware {
+func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int, mapping *lru.LruCache[netip.Addr, string]) middleware {
 	return func(next handler) handler {
 		return func(ctx *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
 			q := r.Question[0]
@@ -156,13 +156,17 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 				return next(ctx, r)
 			}
 
-			var rr D.RR
+			var (
+				rr     D.RR
+				fakeIP netip.Addr
+			)
 			switch q.Qtype {
 			case D.TypeA:
 				if fakePool == nil {
 					return handleMsgWithEmptyAnswer(r), nil
 				}
 				ip := fakePool.Lookup(host)
+				fakeIP = ip
 				rr = &D.A{
 					Hdr: D.RR_Header{Name: q.Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: dnsDefaultTTL},
 					A:   ip.AsSlice(),
@@ -172,6 +176,7 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 					return handleMsgWithEmptyAnswer(r), nil
 				}
 				ip := fakePool6.Lookup(host)
+				fakeIP = ip
 				rr = &D.AAAA{
 					Hdr:  D.RR_Header{Name: q.Name, Rrtype: D.TypeAAAA, Class: D.ClassINET, Ttl: dnsDefaultTTL},
 					AAAA: ip.AsSlice(),
@@ -190,6 +195,12 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 			msg.SetRcode(r, D.RcodeSuccess)
 			msg.Authoritative = true
 			msg.RecursionAvailable = true
+
+			if mapping != nil && fakeIP.IsValid() {
+				// Keep fake-ip fallback entries in the bounded LRU cache so delayed
+				// connections can still recover after resolver rebuilds or pool misses.
+				mapping.Set(fakeIP, host)
+			}
 
 			return msg, nil
 		}
@@ -238,7 +249,7 @@ func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
 	}
 
 	if mapper.mode == C.DNSFakeIP {
-		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL))
+		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL, mapper.mapping))
 	}
 
 	if mapper.mode != C.DNSNormal {

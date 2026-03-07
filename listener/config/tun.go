@@ -36,6 +36,8 @@ type Tun struct {
 	RouteExcludeAddressSet                []string       `yaml:"route-exclude-address-set" json:"route-exclude-address-set,omitempty"`
 	IncludeInterface                      []string       `yaml:"include-interface" json:"include-interface,omitempty"`
 	ExcludeInterface                      []string       `yaml:"exclude-interface" json:"exclude-interface,omitempty"`
+	ExcludeProcess                        []string       `yaml:"exclude-process" json:"exclude-process,omitempty"`
+	ExcludeProcessPath                    []string       `yaml:"exclude-process-path" json:"exclude-process-path,omitempty"`
 	IncludeUID                            []uint32       `yaml:"include-uid" json:"include-uid,omitempty"`
 	IncludeUIDRange                       []string       `yaml:"include-uid-range" json:"include-uid-range,omitempty"`
 	ExcludeUID                            []uint32       `yaml:"exclude-uid" json:"exclude-uid,omitempty"`
@@ -79,6 +81,8 @@ func (t *Tun) Sort() {
 	slices.Sort(t.RouteExcludeAddressSet)
 	slices.Sort(t.IncludeInterface)
 	slices.Sort(t.ExcludeInterface)
+	slices.Sort(t.ExcludeProcess)
+	slices.Sort(t.ExcludeProcessPath)
 	slices.Sort(t.IncludeUID)
 	slices.Sort(t.IncludeUIDRange)
 	slices.Sort(t.ExcludeUID)
@@ -170,6 +174,12 @@ func (t *Tun) Equal(other Tun) bool {
 		return false
 	}
 	if !slices.Equal(t.ExcludeInterface, other.ExcludeInterface) {
+		return false
+	}
+	if !slices.Equal(t.ExcludeProcess, other.ExcludeProcess) {
+		return false
+	}
+	if !slices.Equal(t.ExcludeProcessPath, other.ExcludeProcessPath) {
 		return false
 	}
 	if !slices.Equal(t.IncludeUID, other.IncludeUID) {

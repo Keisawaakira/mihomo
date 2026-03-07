@@ -86,6 +86,8 @@ type tunSchema struct {
 	RouteExcludeAddressSet                *[]string       `yaml:"route-exclude-address-set" json:"route-exclude-address-set,omitempty"`
 	IncludeInterface                      *[]string       `yaml:"include-interface" json:"include-interface,omitempty"`
 	ExcludeInterface                      *[]string       `yaml:"exclude-interface" json:"exclude-interface,omitempty"`
+	ExcludeProcess                        *[]string       `yaml:"exclude-process" json:"exclude-process,omitempty"`
+	ExcludeProcessPath                    *[]string       `yaml:"exclude-process-path" json:"exclude-process-path,omitempty"`
 	IncludeUID                            *[]uint32       `yaml:"include-uid" json:"include-uid,omitempty"`
 	IncludeUIDRange                       *[]string       `yaml:"include-uid-range" json:"include-uid-range,omitempty"`
 	ExcludeUID                            *[]uint32       `yaml:"exclude-uid" json:"exclude-uid,omitempty"`
@@ -227,6 +229,12 @@ func pointerOrDefaultTun(p *tunSchema, def LC.Tun) LC.Tun {
 		}
 		if p.ExcludeInterface != nil {
 			def.ExcludeInterface = *p.ExcludeInterface
+		}
+		if p.ExcludeProcess != nil {
+			def.ExcludeProcess = *p.ExcludeProcess
+		}
+		if p.ExcludeProcessPath != nil {
+			def.ExcludeProcessPath = *p.ExcludeProcessPath
 		}
 		if p.IncludeUID != nil {
 			def.IncludeUID = *p.IncludeUID

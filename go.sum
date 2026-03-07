@@ -1,3 +1,7 @@
+github.com/Keisawaakira/sing-tun v0.4.17-0.20260307121557-ef053a637bb9 h1:pYkgujjuEv9JuJXoN8FGcNh1qGLGo6IL8CV8qnnWyKw=
+github.com/Keisawaakira/sing-tun v0.4.17-0.20260307121557-ef053a637bb9/go.mod h1:B6yQeNjcKWNcVCv14vCmZgKvlk9qycYS0j8E0jX9flI=
+github.com/Keisawaakira/sing-tun v0.4.17-0.20260307132812-10af0e1c384a h1:dPtCcAgGvlhKvflhm+3ny0FClH9ty2Zo41i8fFXLSgs=
+github.com/Keisawaakira/sing-tun v0.4.17-0.20260307132812-10af0e1c384a/go.mod h1:B6yQeNjcKWNcVCv14vCmZgKvlk9qycYS0j8E0jX9flI=
 github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=
 github.com/RyuaNerin/go-krypto v1.3.0/go.mod h1:9R9TU936laAIqAmjcHo/LsaXYOZlymudOAxjaBf62UM=
 github.com/RyuaNerin/testingutil v0.1.0 h1:IYT6JL57RV3U2ml3dLHZsVtPOP6yNK7WUVdzzlpNrss=
