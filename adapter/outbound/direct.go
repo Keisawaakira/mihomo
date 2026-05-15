@@ -2,19 +2,12 @@ package outbound
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net"
-	"net/netip"
-	"strings"
-	"sync"
-	"time"
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/log"
 )
 
 type Direct struct {
@@ -27,21 +20,6 @@ type DirectOption struct {
 	Name string `proxy:"name"`
 }
 
-const (
-	directLiteralIPv6FastFailTimeout = 1500 * time.Millisecond
-	directLiteralIPv6LogInterval     = 30 * time.Second
-)
-
-type directLiteralIPv6TimeoutWindow struct {
-	lastLog time.Time
-	count   int
-}
-
-var (
-	directLiteralIPv6TimeoutsMu sync.Mutex
-	directLiteralIPv6Timeouts   = map[string]directLiteralIPv6TimeoutWindow{}
-)
-
 // DialContext implements C.ProxyAdapter
 func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	if err := d.loopBack.CheckConn(metadata); err != nil {
@@ -49,16 +27,7 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
 	}
 	opts := d.DialOptions()
 	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver))
-	dialCtx := ctx
-	if shouldFastFailDirectLiteralIPv6(metadata) {
-		var cancel context.CancelFunc
-		dialCtx, cancel = context.WithTimeout(ctx, directLiteralIPv6FastFailTimeout)
-		defer cancel()
-	}
-	c, err := dialer.DialContext(dialCtx, "tcp", metadata.RemoteAddress(), opts...)
-	if err != nil && shouldTraceDirectLiteralIPv6Timeout(metadata, err) {
-		logDirectLiteralIPv6Timeout(metadata, err)
-	}
+	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -134,65 +103,4 @@ func NewCompatible() *Direct {
 		}),
 		loopBack: loopback.NewDetector(),
 	}
-}
-
-func shouldFastFailDirectLiteralIPv6(metadata *C.Metadata) bool {
-	if metadata == nil {
-		return false
-	}
-	if !metadata.DstIP.IsValid() || !metadata.DstIP.Is6() {
-		return false
-	}
-	if metadata.Host != "" {
-		return false
-	}
-	return true
-}
-
-func shouldTraceDirectLiteralIPv6Timeout(metadata *C.Metadata, err error) bool {
-	if !shouldFastFailDirectLiteralIPv6(metadata) || err == nil {
-		return false
-	}
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout() || errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "i/o timeout")
-}
-
-func currentInterfaceHint(destination netip.Addr) string {
-	finder := dialer.DefaultInterfaceFinder.Load()
-	if finder == nil || !destination.IsValid() {
-		return ""
-	}
-	return finder.FindInterfaceName(destination)
-}
-
-func logDirectLiteralIPv6Timeout(metadata *C.Metadata, err error) {
-	prefix := prefix64(metadata.DstIP)
-	ifaceName := currentInterfaceHint(metadata.DstIP)
-	key := prefix + "|" + ifaceName
-	now := time.Now()
-	directLiteralIPv6TimeoutsMu.Lock()
-	window := directLiteralIPv6Timeouts[key]
-	window.count++
-	if now.Sub(window.lastLog) < directLiteralIPv6LogInterval {
-		directLiteralIPv6Timeouts[key] = window
-		directLiteralIPv6TimeoutsMu.Unlock()
-		return
-	}
-	count := window.count
-	window.lastLog = now
-	window.count = 0
-	directLiteralIPv6Timeouts[key] = window
-	directLiteralIPv6TimeoutsMu.Unlock()
-	log.Warnln("[DirectIPv6] timeout process=%s path=%s remote=%s dst_ip=%s prefix64=%s interface=%s fast_fail=%s count=%d err=%s", metadata.Process, metadata.ProcessPath, metadata.RemoteAddress(), metadata.DstIP, prefix, ifaceName, directLiteralIPv6FastFailTimeout, count, err.Error())
-}
-
-func prefix64(addr netip.Addr) string {
-	if !addr.IsValid() || !addr.Is6() {
-		return ""
-	}
-	prefix, err := addr.Prefix(64)
-	if err != nil {
-		return ""
-	}
-	return prefix.String()
 }
