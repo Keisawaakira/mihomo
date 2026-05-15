@@ -7,11 +7,12 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
-	"github.com/metacubex/sing/common/bufio"
 )
 
 type packetSender struct {
@@ -141,8 +142,6 @@ func (s *packetSender) Send(packet C.PacketAdapter) {
 	case <-s.ctx.Done():
 		packet.Drop() // sender closed when putting data to chan
 	default:
-		metadata := packet.Metadata()
-		log.Warnln("[UDP] sender channel full, drop packet: %s --> %s, process=%s, host=%s", metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host)
 		packet.Drop() // chan is full
 	}
 }
@@ -220,139 +219,270 @@ func closeAllLocalCoon(lAddr string) {
 	})
 }
 
+func handleSocket(inbound, outbound net.Conn) {
+	N.Relay(inbound, outbound)
+}
 
-func handleSocket(metadata *C.Metadata, inbound, outbound net.Conn) {
+const relayTraceAliveAfter = 5 * time.Second
+
+var relayTraceID uint64
+
+type relayTraceSnapshot struct {
+	traceID               uint64
+	startedAt             time.Time
+	lastProgressAt        time.Time
+	lastProgressDirection string
+	lastUploadAt          time.Time
+	lastDownloadAt        time.Time
+	age                   time.Duration
+	idleFor               time.Duration
+	uploadIdleFor         time.Duration
+	downloadIdleFor       time.Duration
+	uploadBytes           int64
+	downloadBytes         int64
+	inboundLocal          string
+	inboundRemote         string
+	outboundLocal         string
+	outboundRemote        string
+}
+
+type relayCopyResult struct {
+	direction   string
+	bytes       int64
+	readBytes   int64
+	writeBytes  int64
+	err         error
+	errSource   string
+	readErr     error
+	writeErr    error
+	closeErr    error
+	closeAction string
+	duration    time.Duration
+}
+
+type relayTraceResult struct {
+	firstDirection      string
+	forceClosedAfterErr bool
+	upload              relayCopyResult
+	download            relayCopyResult
+	duration            time.Duration
+	finalSnapshot       relayTraceSnapshot
+}
+
+type relayTraceState struct {
+	traceID              uint64
+	startedAt            time.Time
+	uploadBytes          int64
+	downloadBytes        int64
+	lastUploadProgress   int64
+	lastDownloadProgress int64
+	inboundLocal         string
+	inboundRemote        string
+	outboundLocal        string
+	outboundRemote       string
+}
+
+func newRelayTraceState(inbound, outbound net.Conn) *relayTraceState {
+	now := time.Now()
+	lastProgress := now.UnixNano()
+	return &relayTraceState{
+		traceID:              atomic.AddUint64(&relayTraceID, 1),
+		startedAt:            now,
+		lastUploadProgress:   lastProgress,
+		lastDownloadProgress: lastProgress,
+		inboundLocal:         netAddrString(inbound.LocalAddr()),
+		inboundRemote:        netAddrString(inbound.RemoteAddr()),
+		outboundLocal:        netAddrString(outbound.LocalAddr()),
+		outboundRemote:       netAddrString(outbound.RemoteAddr()),
+	}
+}
+
+func (s *relayTraceState) snapshot(now time.Time) relayTraceSnapshot {
+	uploadLast := time.Unix(0, atomic.LoadInt64(&s.lastUploadProgress))
+	downloadLast := time.Unix(0, atomic.LoadInt64(&s.lastDownloadProgress))
+	lastProgress := uploadLast
+	lastProgressDirection := "upload"
+	if downloadLast.After(lastProgress) {
+		lastProgress = downloadLast
+		lastProgressDirection = "download"
+	} else if downloadLast.Equal(uploadLast) {
+		lastProgressDirection = "both"
+	}
+	return relayTraceSnapshot{
+		traceID:               s.traceID,
+		startedAt:             s.startedAt,
+		lastProgressAt:        lastProgress,
+		lastProgressDirection: lastProgressDirection,
+		lastUploadAt:          uploadLast,
+		lastDownloadAt:        downloadLast,
+		age:                   now.Sub(s.startedAt),
+		idleFor:               now.Sub(lastProgress),
+		uploadIdleFor:         now.Sub(uploadLast),
+		downloadIdleFor:       now.Sub(downloadLast),
+		uploadBytes:           atomic.LoadInt64(&s.uploadBytes),
+		downloadBytes:         atomic.LoadInt64(&s.downloadBytes),
+		inboundLocal:          s.inboundLocal,
+		inboundRemote:         s.inboundRemote,
+		outboundLocal:         s.outboundLocal,
+		outboundRemote:        s.outboundRemote,
+	}
+}
+
+func handleSocketTrace(inbound, outbound net.Conn, watchdog func(relayTraceSnapshot)) relayTraceResult {
+	state := newRelayTraceState(inbound, outbound)
 	defer func() {
 		_ = inbound.Close()
 		_ = outbound.Close()
 	}()
 
-	ch := make(chan error, 1)
-	go func() {
-		ch <- relay(metadata, "download", inbound, outbound)
-	}()
-
-	_ = relay(metadata, "upload", outbound, inbound)
-	<-ch
-}
-
-func relay(metadata *C.Metadata, direction string, writer net.Conn, reader net.Conn) error {
-	startedAt := time.Now()
-	written, err := bufio.Copy(writer, reader)
-	if err == nil {
-		_, closeErr := closeWrite(writer)
-		_ = closeErr
-		return nil
+	stopWatchdog := make(chan struct{})
+	if watchdog != nil {
+		go watchRelayTrace(state, stopWatchdog, watchdog)
+		defer close(stopWatchdog)
 	}
 
-	closeResult := softCloseRelaySide(writer)
-	if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-		duration := time.Since(startedAt).Round(time.Millisecond)
-		log.Warnln(
-			"[TCP] relay %s error after %d bytes in %s: %s (%s --> %s, process=%s, host=%s, close_write=%t, close_write_target=%T, close_write_err=%v, close_read=%t, close_read_target=%T, close_read_err=%v, hard_close=%t, hard_close_err=%v, writer_type=%T, reader_type=%T)",
-			direction,
-			written,
-			duration,
-			err.Error(),
-			metadata.SourceDetail(),
-			metadata.RemoteAddress(),
-			metadata.Process,
-			metadata.Host,
-			closeResult.closeWrite,
-			closeResult.closeWriteTarget,
-			closeResult.closeWriteErr,
-			closeResult.closeRead,
-			closeResult.closeReadTarget,
-			closeResult.closeReadErr,
-			closeResult.hardClose,
-			closeResult.hardCloseErr,
-			writer,
-			reader,
-		)
+	resultCh := make(chan relayCopyResult, 2)
+	go traceSocketCopy("download", inbound, outbound, &state.downloadBytes, &state.lastDownloadProgress, resultCh)
+	go traceSocketCopy("upload", outbound, inbound, &state.uploadBytes, &state.lastUploadProgress, resultCh)
+
+	first := <-resultCh
+	forceClosedAfterErr := first.err != nil || first.closeErr != nil
+	if forceClosedAfterErr {
+		_ = inbound.Close()
+		_ = outbound.Close()
 	}
-	return err
-}
+	second := <-resultCh
 
-type closeWriter interface {
-	CloseWrite() error
-}
-
-type closeReader interface {
-	CloseRead() error
-}
-
-type upstreamer interface {
-	Upstream() any
-}
-
-type relayCloseResult struct {
-	closeWrite       bool
-	closeWriteTarget any
-	closeWriteErr    error
-	closeRead        bool
-	closeReadTarget  any
-	closeReadErr     error
-	hardClose        bool
-	hardCloseErr     error
-}
-
-func softCloseRelaySide(conn net.Conn) relayCloseResult {
-	var result relayCloseResult
-	if writeCloser, ok := unwrapCloseWriter(conn); ok {
-		result.closeWrite = true
-		result.closeWriteTarget = writeCloser
-		result.closeWriteErr = writeCloser.CloseWrite()
+	result := relayTraceResult{
+		firstDirection:      first.direction,
+		forceClosedAfterErr: forceClosedAfterErr,
+		duration:            time.Since(state.startedAt),
+		finalSnapshot:       state.snapshot(time.Now()),
 	}
-	if readCloser, ok := unwrapCloseReader(conn); ok {
-		result.closeRead = true
-		result.closeReadTarget = readCloser
-		result.closeReadErr = readCloser.CloseRead()
-		return result
-	}
-	if !result.closeWrite {
-		result.hardClose = true
-		result.hardCloseErr = conn.Close()
-	}
+	result.set(first)
+	result.set(second)
 	return result
 }
 
-func closeWrite(conn net.Conn) (bool, error) {
-	if writeCloser, ok := unwrapCloseWriter(conn); ok {
-		return false, writeCloser.CloseWrite()
+func watchRelayTrace(state *relayTraceState, stop <-chan struct{}, watchdog func(relayTraceSnapshot)) {
+	ticker := time.NewTicker(relayTraceAliveAfter)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case now := <-ticker.C:
+			watchdog(state.snapshot(now))
+		case <-stop:
+			return
+		}
 	}
-	return true, conn.Close()
 }
 
-func unwrapCloseWriter(conn any) (closeWriter, bool) {
-	for i := 0; i < 16 && conn != nil; i++ {
-		if writeCloser, ok := conn.(closeWriter); ok {
-			return writeCloser, true
-		}
-		if upstream, ok := conn.(upstreamer); ok {
-			next := upstream.Upstream()
-			if next != nil && next != conn {
-				conn = next
-				continue
-			}
-		}
-		return nil, false
+func (r *relayTraceResult) set(result relayCopyResult) {
+	switch result.direction {
+	case "upload":
+		r.upload = result
+	case "download":
+		r.download = result
 	}
-	return nil, false
 }
 
-func unwrapCloseReader(conn any) (closeReader, bool) {
-	for i := 0; i < 16 && conn != nil; i++ {
-		if readCloser, ok := conn.(closeReader); ok {
-			return readCloser, true
-		}
-		if upstream, ok := conn.(upstreamer); ok {
-			next := upstream.Upstream()
-			if next != nil && next != conn {
-				conn = next
-				continue
+func traceSocketCopy(direction string, dst, src net.Conn, counter *int64, lastProgress *int64, resultCh chan<- relayCopyResult) {
+	startedAt := time.Now()
+	readFrom, writeTo := relayDirectionEndpoints(direction)
+	readBytes, writeBytes, readErr, writeErr := copySocketWithTrace(dst, src, counter, lastProgress)
+	err := readErr
+	errSource := ""
+	if writeErr != nil {
+		err = writeErr
+		errSource = "write_" + writeTo
+	} else if readErr != nil {
+		errSource = "read_" + readFrom
+	}
+	var closeErr error
+	closeAction := "close_write"
+	if err == nil {
+		closeErr = closeWriteConn(dst)
+	} else {
+		closeAction = "close"
+		closeErr = dst.Close()
+	}
+	resultCh <- relayCopyResult{
+		direction:   direction,
+		bytes:       readBytes,
+		readBytes:   readBytes,
+		writeBytes:  writeBytes,
+		err:         err,
+		errSource:   errSource,
+		readErr:     readErr,
+		writeErr:    writeErr,
+		closeErr:    closeErr,
+		closeAction: closeAction,
+		duration:    time.Since(startedAt),
+	}
+}
+
+func copySocketWithTrace(dst, src net.Conn, counter *int64, lastProgress *int64) (readBytes int64, writeBytes int64, readErr error, writeErr error) {
+	buffer := make([]byte, 32*1024)
+	for {
+		nr, er := src.Read(buffer)
+		if nr > 0 {
+			readBytes += int64(nr)
+			atomic.AddInt64(counter, int64(nr))
+			atomic.StoreInt64(lastProgress, time.Now().UnixNano())
+			nw, ew := writeFull(dst, buffer[:nr])
+			writeBytes += int64(nw)
+			if ew != nil {
+				writeErr = ew
+				return
+			}
+			if nw != nr {
+				writeErr = io.ErrShortWrite
+				return
 			}
 		}
-		return nil, false
+		if er != nil {
+			if er != io.EOF {
+				readErr = er
+			}
+			return
+		}
 	}
-	return nil, false
+}
+
+func writeFull(dst net.Conn, payload []byte) (written int, err error) {
+	for written < len(payload) {
+		n, writeErr := dst.Write(payload[written:])
+		if n > 0 {
+			written += n
+		}
+		if writeErr != nil {
+			return written, writeErr
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
+}
+
+func relayDirectionEndpoints(direction string) (readFrom string, writeTo string) {
+	if direction == "upload" {
+		return "inbound", "outbound"
+	}
+	return "outbound", "inbound"
+}
+
+func closeWriteConn(conn net.Conn) error {
+	if closeWriter, ok := conn.(interface{ CloseWrite() error }); ok {
+		return closeWriter.CloseWrite()
+	}
+	return conn.Close()
+}
+
+func netAddrString(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
 }

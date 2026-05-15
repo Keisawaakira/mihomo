@@ -15,8 +15,8 @@ import (
 	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
-	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/proxydialer"
@@ -72,18 +72,27 @@ var (
 
 	excludedProcessNames []string
 	excludedProcessPaths []string
-	excludedLoopBack      = loopback.NewDetector()
-	excludedProcessCache  = make(map[string]excludedProcessEntry)
-	excludedProcessMu     sync.RWMutex
+	excludedLoopBack     = loopback.NewDetector()
+	excludedProcessCache = make(map[string]excludedProcessEntry)
+	excludedProcessMu    sync.RWMutex
 )
+
 const excludedProcessCacheTTL = 2 * time.Minute
+
+const (
+	tcpRelayStallWarnAfter           = 90 * time.Second
+	tcpRelayLowTrafficStallWarnAfter = 3 * time.Minute
+	tcpRelayStallMinAge              = 20 * time.Second
+	tcpRelayStallMaxAge              = 10 * time.Minute
+	tcpRelayStallMinBytes            = int64(32 * 1024)
+	tcpRelayStallBidirectionalBytes  = int64(4 * 1024)
+)
 
 type excludedProcessEntry struct {
 	process string
 	path    string
 	expire  time.Time
 }
-
 
 type tunnel struct{}
 
@@ -500,11 +509,9 @@ func tryRecoverFakeIPMapping(metadata *C.Metadata) bool {
 	}
 
 	originalDstIP := metadata.DstIP
-	existsInPool := resolver.IsExistFakeIP(originalDstIP)
-	log.Warnln("[FakeIP] record missing, start soft recovery: ip=%s, exists_in_pool=%t, %s --> %s, process=%s, host=%s", originalDstIP, existsInPool, metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host)
 
 	retryDelays := []time.Duration{80 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
-	for attempt, delay := range retryDelays {
+	for _, delay := range retryDelays {
 		time.Sleep(delay)
 		host, exist := resolver.FindHostByIP(originalDstIP)
 		if !exist {
@@ -512,11 +519,9 @@ func tryRecoverFakeIPMapping(metadata *C.Metadata) bool {
 		}
 		resolver.InsertHostByIP(originalDstIP, host)
 		applyMappedHost(metadata, host, originalDstIP)
-		log.Warnln("[FakeIP] soft recovery hit: ip=%s, host=%s, attempt=%d, exists_in_pool=%t, %s --> %s, process=%s", originalDstIP, host, attempt+1, existsInPool, metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process)
 		return true
 	}
 
-	log.Warnln("[FakeIP] soft recovery missed: ip=%s, exists_in_pool=%t, %s --> %s, process=%s, host=%s", originalDstIP, existsInPool, metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host)
 	return false
 }
 
@@ -651,10 +656,10 @@ type excludedDirectConn struct {
 	addr  string
 }
 
-func (c *excludedDirectConn) Chains() C.Chain { return c.chain }
-func (c *excludedDirectConn) ProviderChains() C.Chain { return nil }
+func (c *excludedDirectConn) Chains() C.Chain                       { return c.chain }
+func (c *excludedDirectConn) ProviderChains() C.Chain               { return nil }
 func (c *excludedDirectConn) AppendToChains(adapter C.ProxyAdapter) {}
-func (c *excludedDirectConn) RemoteDestination() string { return c.addr }
+func (c *excludedDirectConn) RemoteDestination() string             { return c.addr }
 func (c *excludedDirectConn) CloseWrite() error {
 	if cw, ok := c.ExtendedConn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
@@ -674,10 +679,10 @@ type excludedDirectPacketConn struct {
 	addr  string
 }
 
-func (c *excludedDirectPacketConn) Chains() C.Chain { return c.chain }
-func (c *excludedDirectPacketConn) ProviderChains() C.Chain { return nil }
+func (c *excludedDirectPacketConn) Chains() C.Chain                       { return c.chain }
+func (c *excludedDirectPacketConn) ProviderChains() C.Chain               { return nil }
 func (c *excludedDirectPacketConn) AppendToChains(adapter C.ProxyAdapter) {}
-func (c *excludedDirectPacketConn) RemoteDestination() string { return c.addr }
+func (c *excludedDirectPacketConn) RemoteDestination() string             { return c.addr }
 func (c *excludedDirectPacketConn) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 	return resolveExcludedUDPMetadata(ctx, metadata)
 }
@@ -783,7 +788,6 @@ func handleUDPConn(packet C.PacketAdapter) {
 		return
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
-
 
 	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
 		packet.Drop()
@@ -926,7 +930,10 @@ func handleTCPConn(connCtx C.ConnContext) {
 		defer func(remoteConn C.Conn) {
 			_ = remoteConn.Close()
 		}(remoteConn)
-		handleSocket(metadata, conn, remoteConn)
+		relayResult := handleSocketTrace(conn, remoteConn, newTCPRelayWatchdog("excluded-relay", metadata, nil, nil, remoteConn))
+		if shouldLogTCPRelayResult(relayResult) {
+			logTraceTCPRelay("excluded-relay-done", metadata, nil, nil, remoteConn, relayResult)
+		}
 		return
 	}
 
@@ -1010,7 +1017,142 @@ func handleTCPConn(connCtx C.ConnContext) {
 	peekMutex.Lock()
 	defer peekMutex.Unlock()
 	_ = conn.SetReadDeadline(time.Time{}) // reset
-	handleSocket(metadata, conn, remoteConn)
+	relayResult := handleSocketTrace(conn, remoteConn, newTCPRelayWatchdog("relay", metadata, rule, proxy, remoteConn))
+	if shouldLogTCPRelayResult(relayResult) {
+		logTraceTCPRelay("relay-done", metadata, rule, proxy, remoteConn, relayResult)
+	}
+}
+
+func newTCPRelayWatchdog(stage string, metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, remoteConn C.Conn) func(relayTraceSnapshot) {
+	var warned bool
+	return func(snapshot relayTraceSnapshot) {
+		totalBytes := snapshot.uploadBytes + snapshot.downloadBytes
+		if snapshot.age < tcpRelayStallMinAge || snapshot.age > tcpRelayStallMaxAge {
+			return
+		}
+
+		warnAfter := tcpRelayStallWarnAfter
+		if !relayTraceHasMeaningfulTraffic(snapshot, totalBytes) {
+			warnAfter = tcpRelayLowTrafficStallWarnAfter
+		}
+		if snapshot.idleFor < warnAfter {
+			warned = false
+			return
+		}
+		if !warned {
+			logTraceTCPRelayStall(stage+"-stall-warn", metadata, rule, proxy, remoteConn, snapshot)
+			warned = true
+		}
+	}
+}
+
+func relayTraceHasMeaningfulTraffic(snapshot relayTraceSnapshot, totalBytes int64) bool {
+	if totalBytes >= tcpRelayStallMinBytes {
+		return true
+	}
+	return snapshot.uploadBytes >= tcpRelayStallBidirectionalBytes &&
+		snapshot.downloadBytes >= tcpRelayStallBidirectionalBytes
+}
+
+func shouldLogTCPRelayResult(result relayTraceResult) bool {
+	return relayTraceResultAbnormal(result)
+}
+
+func relayTraceResultAbnormal(result relayTraceResult) bool {
+	return relayTraceHardError(result.upload.err) ||
+		relayTraceHardError(result.upload.closeErr) ||
+		relayTraceHardError(result.download.err) ||
+		relayTraceHardError(result.download.closeErr)
+}
+
+func relayTraceHardError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "use of closed network connection") || strings.Contains(message, "closed pipe") || message == "eof" {
+		return false
+	}
+	return strings.Contains(message, "wsarecv") ||
+		strings.Contains(message, "i/o timeout") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "forcibly closed") ||
+		strings.Contains(message, "failed")
+}
+
+func logTraceTCPRelayStall(stage string, metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, remoteConn C.Connection, snapshot relayTraceSnapshot) {
+	ruleText := ""
+	if rule != nil {
+		ruleText = rule.RuleType().String()
+		if payload := rule.Payload(); payload != "" {
+			ruleText += "/" + payload
+		}
+	}
+	proxyName := ""
+	if proxy != nil {
+		proxyName = proxy.Name()
+	}
+	chains := ""
+	if remoteConn != nil {
+		chains = remoteConn.Chains().String()
+	}
+	totalBytes := snapshot.uploadBytes + snapshot.downloadBytes
+	lastProgressSinceStart := snapshot.lastProgressAt.Sub(snapshot.startedAt)
+	lastUploadSinceStart := snapshot.lastUploadAt.Sub(snapshot.startedAt)
+	lastDownloadSinceStart := snapshot.lastDownloadAt.Sub(snapshot.startedAt)
+	trafficClass := "low"
+	if relayTraceHasMeaningfulTraffic(snapshot, totalBytes) {
+		trafficClass = "meaningful"
+	}
+	log.Warnln("[TraceTCP] stage=%s trace_id=%d age=%s idle_for=%s upload_idle=%s download_idle=%s traffic_class=%s total_bytes=%d upload_bytes=%d download_bytes=%d last_progress=%s last_progress_at=%s last_progress_since_start=%s last_upload_at=%s last_upload_since_start=%s last_download_at=%s last_download_since_start=%s inbound_local=%s inbound_remote=%s outbound_local=%s outbound_remote=%s network=%s %s --> %s process=%s host=%s dst_ip=%s dns_mode=%s rule=%s proxy=%s chains=%s", stage, snapshot.traceID, snapshot.age.Round(time.Millisecond), snapshot.idleFor.Round(time.Millisecond), snapshot.uploadIdleFor.Round(time.Millisecond), snapshot.downloadIdleFor.Round(time.Millisecond), trafficClass, totalBytes, snapshot.uploadBytes, snapshot.downloadBytes, snapshot.lastProgressDirection, traceTimeString(snapshot.lastProgressAt), lastProgressSinceStart.Round(time.Millisecond), traceTimeString(snapshot.lastUploadAt), lastUploadSinceStart.Round(time.Millisecond), traceTimeString(snapshot.lastDownloadAt), lastDownloadSinceStart.Round(time.Millisecond), snapshot.inboundLocal, snapshot.inboundRemote, snapshot.outboundLocal, snapshot.outboundRemote, strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host, metadata.DstIP, metadata.DNSMode.String(), ruleText, proxyName, chains)
+}
+
+func logTraceTCPRelay(stage string, metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, remoteConn C.Connection, result relayTraceResult) {
+	ruleText := ""
+	if rule != nil {
+		ruleText = rule.RuleType().String()
+		if payload := rule.Payload(); payload != "" {
+			ruleText += "/" + payload
+		}
+	}
+	proxyName := ""
+	if proxy != nil {
+		proxyName = proxy.Name()
+	}
+	chains := ""
+	connLocal, connRemote := traceConnEndpoints(remoteConn)
+	if remoteConn != nil {
+		chains = remoteConn.Chains().String()
+	}
+	log.Warnln("[TraceTCP] stage=%s trace_id=%d duration=%s idle_for=%s upload_idle=%s download_idle=%s first=%s forced_close=%t conn_local=%s conn_remote=%s inbound_local=%s inbound_remote=%s outbound_local=%s outbound_remote=%s upload_bytes=%d upload_read_bytes=%d upload_write_bytes=%d upload_err_source=%s upload_err=%v upload_read_err=%v upload_write_err=%v upload_close_action=%s upload_close_err=%v upload_duration=%s download_bytes=%d download_read_bytes=%d download_write_bytes=%d download_err_source=%s download_err=%v download_read_err=%v download_write_err=%v download_close_action=%s download_close_err=%v download_duration=%s network=%s %s --> %s process=%s host=%s dst_ip=%s dns_mode=%s rule=%s proxy=%s chains=%s", stage, result.finalSnapshot.traceID, result.duration.Round(time.Millisecond), result.finalSnapshot.idleFor.Round(time.Millisecond), result.finalSnapshot.uploadIdleFor.Round(time.Millisecond), result.finalSnapshot.downloadIdleFor.Round(time.Millisecond), result.firstDirection, result.forceClosedAfterErr, connLocal, connRemote, result.finalSnapshot.inboundLocal, result.finalSnapshot.inboundRemote, result.finalSnapshot.outboundLocal, result.finalSnapshot.outboundRemote, result.upload.bytes, result.upload.readBytes, result.upload.writeBytes, result.upload.errSource, result.upload.err, result.upload.readErr, result.upload.writeErr, result.upload.closeAction, result.upload.closeErr, result.upload.duration.Round(time.Millisecond), result.download.bytes, result.download.readBytes, result.download.writeBytes, result.download.errSource, result.download.err, result.download.readErr, result.download.writeErr, result.download.closeAction, result.download.closeErr, result.download.duration.Round(time.Millisecond), strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), metadata.Process, metadata.Host, metadata.DstIP, metadata.DNSMode.String(), ruleText, proxyName, chains)
+}
+
+func traceTimeString(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339Nano)
+}
+
+func traceConnEndpoints(conn C.Connection) (local string, remote string) {
+	if conn == nil {
+		return "", ""
+	}
+	if netConn, ok := conn.(interface {
+		LocalAddr() net.Addr
+		RemoteAddr() net.Addr
+	}); ok {
+		local = traceNetAddrString(netConn.LocalAddr())
+		remote = traceNetAddrString(netConn.RemoteAddr())
+	}
+	return
+}
+
+func traceNetAddrString(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
 }
 
 func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err error) {
