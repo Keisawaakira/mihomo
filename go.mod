@@ -150,4 +150,4 @@ require (
 // for https://github.com/golang/protobuf/issues/1704
 replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
 
-replace github.com/metacubex/sing-tun => github.com/Keisawaakira/sing-tun v0.4.22-0.20260630125948-0ee4c8ad2ab5
+replace github.com/metacubex/sing-tun => github.com/Keisawaakira/sing-tun v0.4.28-0.20261003013956-d079b10359de
